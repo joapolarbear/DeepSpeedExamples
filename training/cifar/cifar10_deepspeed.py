@@ -111,7 +111,8 @@ transform = transforms.Compose([
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
-if torch.distributed.get_rank() != 0:
+RANK = torch.distributed.get_rank()
+if RANK != 0:
     # might be downloading cifar data, let rank 0 download first
     torch.distributed.barrier()
 
@@ -120,7 +121,7 @@ trainset = torchvision.datasets.CIFAR10(root='./data',
                                         download=True,
                                         transform=transform)
 
-if torch.distributed.get_rank() == 0:
+if RANK == 0:
     # cifar data is downloaded, indicate other ranks can proceed
     torch.distributed.barrier()
 
@@ -159,7 +160,7 @@ def imshow(img):
 
 # get some random training images
 dataiter = iter(trainloader)
-images, labels = dataiter.next()
+images, labels = next(dataiter)
 
 # show images
 imshow(torchvision.utils.make_grid(images))
@@ -257,6 +258,8 @@ print(f'fp16={fp16}')
 # Let's use a Classification Cross-Entropy loss and SGD with momentum.
 
 import torch.optim as optim
+import os
+from torch.profiler import profile, record_function, ProfilerActivity
 
 criterion = nn.CrossEntropyLoss()
 #optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
@@ -278,11 +281,16 @@ for epoch in range(2):  # loop over the dataset multiple times
             model_engine.local_rank)
         if fp16:
             inputs = inputs.half()
-        outputs = model_engine(inputs)
-        loss = criterion(outputs, labels)
+        
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            outputs = model_engine(inputs)
+            loss = criterion(outputs, labels)
 
-        model_engine.backward(loss)
-        model_engine.step()
+            model_engine.backward(loss)
+            model_engine.step()
+        
+        if i == 1:
+            prof.export_chrome_trace(os.path.join(".workspace", f"trace{i}.json"))
 
         # print statistics
         running_loss += loss.item()
@@ -291,6 +299,10 @@ for epoch in range(2):  # loop over the dataset multiple times
                 1):  # print every log_interval mini-batches
             print('[%d, %5d] loss: %.3f' %
                   (epoch + 1, i + 1, running_loss / args.log_interval))
+            if args.moe:
+                for moe_layer in net.moe_layer_list:
+                    ep_distribution = moe_layer.deepspeed_moe.experts.ep_distribution
+                    print(f"[Rank {RANK}] {str(ep_distribution)}\n")
             running_loss = 0.0
 
 print('Finished Training')
@@ -309,7 +321,7 @@ print('Finished Training')
 # Okay, first step. Let us display an image from the test set to get familiar.
 
 dataiter = iter(testloader)
-images, labels = dataiter.next()
+images, labels = next(dataiter)
 
 # print images
 imshow(torchvision.utils.make_grid(images))
