@@ -178,6 +178,9 @@ import torch.nn.functional as F
 
 args = add_argument()
 
+import os
+from torch.profiler import profile, record_function, ProfilerActivity
+import OEM_util
 
 class Net(nn.Module):
     def __init__(self):
@@ -208,22 +211,29 @@ class Net(nn.Module):
             self.fc3 = nn.Linear(84, 10)
 
     def forward(self, x):
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        with record_function("OEM:L0"):
+            x = self.pool(F.relu(self.conv1(x)))
+            x = self.pool(F.relu(self.conv2(x)))
+            x = x.view(-1, 16 * 5 * 5)
+            x = F.relu(self.fc1(x))
+            x = F.relu(self.fc2(x))
         if args.moe:
-            for layer in self.moe_layer_list:
-                x, _, _ = layer(x)
-            x = self.fc4(x)
+            with record_function("OEM:MoE_L0"):
+                for layer in self.moe_layer_list:
+                    x, _, _ = layer(x)
+            with record_function("OEM:L1"):
+                x = self.fc4(x)
         else:
-            x = self.fc3(x)
+            with record_function("OEM:L1"):
+                x = self.fc3(x)
         return x
 
 
 net = Net()
 
+profiler = OEM_util.Profiler()
+if RANK == 0:
+    profiler.register(net)
 
 def create_moe_param_groups(model):
     from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
@@ -258,8 +268,6 @@ print(f'fp16={fp16}')
 # Let's use a Classification Cross-Entropy loss and SGD with momentum.
 
 import torch.optim as optim
-import os
-from torch.profiler import profile, record_function, ProfilerActivity
 
 criterion = nn.CrossEntropyLoss()
 #optimizer = optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
@@ -272,38 +280,56 @@ criterion = nn.CrossEntropyLoss()
 # We simply have to loop over our data iterator, and feed the inputs to the
 # network and optimize.
 
-for epoch in range(2):  # loop over the dataset multiple times
+# def trace_handler(p):
+#     output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=10)
+#     print(output)
+#     p.export_chrome_trace(f".workspace/trace_R{RANK}I{p.step_num}.json")
+
+
+
+for epoch in range(50):  # loop over the dataset multiple times
 
     running_loss = 0.0
+    # with torch.profiler.profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #     schedule=torch.profiler.schedule(
+    #         wait=5,     # During this phase profiler is not active.
+    #         warmup=2,   # During this phase profiler starts tracing, but the results are discarded.
+    #         active=6,   # During this phase profiler traces and records data.
+    #         repeat=2),  # Specifies an upper bound on the number of cycles.
+    #     on_trace_ready=trace_handler,
+    #     with_stack=True # Enable stack tracing, adds extra profiling overhead.
+    # ) as profiler:
     for i, data in enumerate(trainloader):
         # get the inputs; data is a list of [inputs, labels]
         inputs, labels = data[0].to(model_engine.local_rank), data[1].to(
             model_engine.local_rank)
         if fp16:
             inputs = inputs.half()
-        
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            outputs = model_engine(inputs)
-            loss = criterion(outputs, labels)
 
-            model_engine.backward(loss)
-            model_engine.step()
+        outputs = model_engine(inputs)
         
-        if i == 1:
-            prof.export_chrome_trace(os.path.join(".workspace", f"trace{i}.json"))
+        loss = criterion(outputs, labels)
 
+        model_engine.backward(loss)
+        model_engine.step()
+
+        # with record_function("OEM:STEP"):
+        
         # print statistics
         running_loss += loss.item()
         if i % args.log_interval == (
                 args.log_interval -
                 1):  # print every log_interval mini-batches
             print('[%d, %5d] loss: %.3f' %
-                  (epoch + 1, i + 1, running_loss / args.log_interval))
+                (epoch + 1, i + 1, running_loss / args.log_interval))
             if args.moe:
                 for moe_layer in net.moe_layer_list:
                     ep_distribution = moe_layer.deepspeed_moe.experts.ep_distribution
                     print(f"[Rank {RANK}] {str(ep_distribution)}\n")
             running_loss = 0.0
+
+        profiler.step(dump=(i % 10 == 0 and i != 0))
 
 print('Finished Training')
 

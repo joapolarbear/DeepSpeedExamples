@@ -9,6 +9,8 @@ EP_SIZE=2
 # Number of total experts
 EXPERTS=6
 
+export PYTHONPATH=$HOME:$PYTHONPATH
+
 deepspeed --num_nodes=${NUM_NODES} --num_gpus=${NUM_GPUS} cifar10_deepspeed.py \
 	--log-interval 100 \
 	--deepspeed \

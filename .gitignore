@@ -132,3 +132,4 @@ dmypy.json
 
 *.gz
 /training/cifar/data
+*.workspace
